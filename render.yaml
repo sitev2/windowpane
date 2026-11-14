@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: windowpane
+    runtime: node
+    plan: free
+    buildCommand: "true"
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PASSWORD
+        sync: false   # you type this in on Render's dashboard
