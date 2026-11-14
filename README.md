@@ -10,6 +10,9 @@ A browser inside a browser. Open your deployed address in Safari (or any browser
 
 The free plan sleeps after about 15 minutes of no use, so the first load after a break takes up to a minute.
 
+## Also host the interface on GitHub Pages
+In the repo: Settings > Pages > deploy from branch main, folder /docs. The page at https://<user>.github.io/windowpane/ signs in to your Render server (ALLOW_ORIGIN in render.yaml must match your github.io origin).
+
 ## Run locally
     node server.js
     open http://127.0.0.1:8080

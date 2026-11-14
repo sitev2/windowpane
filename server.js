@@ -13,6 +13,7 @@ const HOST = process.env.HOST || '127.0.0.1';
 const PORT = +process.env.PORT || 8080;
 const PUBLIC = path.join(__dirname, 'public');
 const PASSWORD = process.env.PASSWORD || '';
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || ''; // e.g. https://sitev2.github.io
 if (!PASSWORD && !['127.0.0.1', 'localhost'].includes(HOST)) {
   console.error('Refusing to listen on a public address without a PASSWORD environment variable.');
   process.exit(1);
@@ -23,6 +24,10 @@ const sha = (s) => crypto.createHash('sha256').update(String(s)).digest();
 const fails = new Map(); // ip -> {n, t}
 function authed(req) {
   if (!PASSWORD) return true;
+  try {
+    const k = new URL(req.url, 'http://x').searchParams.get('k');
+    if (k && k.length === TOKEN.length && crypto.timingSafeEqual(Buffer.from(k), Buffer.from(TOKEN))) return true;
+  } catch {}
   const m = /(?:^|;\s*)wp=([a-f0-9]+)/.exec(req.headers.cookie || '');
   return !!m && m[1].length === TOKEN.length && crypto.timingSafeEqual(Buffer.from(m[1]), Buffer.from(TOKEN));
 }
@@ -39,19 +44,22 @@ function handleLogin(req, res) {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   const f = fails.get(ip) || { n: 0, t: Date.now() };
   if (Date.now() - f.t > 600000) { f.n = 0; f.t = Date.now(); }
-  if (f.n >= 10) { res.writeHead(429, { 'content-type': 'text/html' }); return res.end(loginPage('Too many attempts. Try again in 10 minutes.')); }
+  const isApi = req.url === '/api/login';
+  if (f.n >= 10) { res.writeHead(429, { 'content-type': isApi ? 'application/json' : 'text/html' }); return res.end(isApi ? '{"error":"Too many attempts. Try again in 10 minutes."}' : loginPage('Too many attempts. Try again in 10 minutes.')); }
   let body = '';
   req.on('data', (c) => { body += c; if (body.length > 4096) req.destroy(); });
   req.on('end', () => {
-    const pw = new URLSearchParams(body).get('password') || '';
+    let pw = '';
+    try { pw = isApi ? String(JSON.parse(body || '{}').password || '') : (new URLSearchParams(body).get('password') || ''); } catch {}
     if (crypto.timingSafeEqual(sha(pw), sha(PASSWORD))) {
+      if (isApi) { res.writeHead(200, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ token: TOKEN })); }
       const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
       res.writeHead(302, { location: '/', 'set-cookie': `wp=${TOKEN}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${secure}` });
       return res.end();
     }
     f.n++; fails.set(ip, f);
-    res.writeHead(401, { 'content-type': 'text/html' });
-    res.end(loginPage('Wrong password.'));
+    res.writeHead(401, { 'content-type': isApi ? 'application/json' : 'text/html' });
+    res.end(isApi ? '{"error":"Wrong password."}' : loginPage('Wrong password.'));
   });
 }
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
@@ -68,7 +76,7 @@ function isPrivate(ip) {
     (l.startsWith('::ffff:') && isPrivate(l.slice(7)));
 }
 
-const px = (u) => '/proxy?url=' + encodeURIComponent(u);
+const px = (u) => '/proxy?url=' + encodeURIComponent(u) + (PASSWORD ? '&k=' + TOKEN : '');
 function abs(u, base) {
   try { return new URL(u, base).href; } catch { return null; }
 }
@@ -81,8 +89,8 @@ function rewriteUrl(u, base) {
 
 function injected(realUrl) {
   return `<script>(function(){
-var REAL=${JSON.stringify(realUrl)};
-function P(u){try{var a=new URL(u,REAL).href;return /^https?:/.test(a)?'/proxy?url='+encodeURIComponent(a):u}catch(e){return u}}
+var REAL=${JSON.stringify(realUrl)};var K=${JSON.stringify(PASSWORD ? '&k=' + TOKEN : '')};
+function P(u){try{var a=new URL(u,REAL).href;return /^https?:/.test(a)?'/proxy?url='+encodeURIComponent(a)+K:u}catch(e){return u}}
 var f=window.fetch;if(f)window.fetch=function(i,o){try{if(typeof i==='string')i=P(i);else if(i&&i.url)i=new Request(P(i.url),i)}catch(e){}return f.call(this,i,o)};
 var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){arguments[1]=P(String(u));return xo.apply(this,arguments)};
 window.open=function(u){if(u)location.href=P(u);return null};
@@ -132,7 +140,8 @@ async function handleProxy(req, res, reqUrl, hops = 0) {
   const up = lib.request(u, { method: req.method, headers, timeout: 20000 }, (r) => {
     const h = { ...r.headers };
     ['x-frame-options', 'content-security-policy', 'content-security-policy-report-only', 'strict-transport-security',
-      'content-encoding', 'content-length', 'set-cookie', 'cross-origin-opener-policy', 'cross-origin-embedder-policy'].forEach(k => delete h[k]);
+      'content-encoding', 'content-length', 'set-cookie', 'referrer-policy', 'cross-origin-opener-policy', 'cross-origin-embedder-policy'].forEach(k => delete h[k]);
+    h['referrer-policy'] = 'no-referrer';
     if (h.location) {
       const l = abs(h.location, u.href);
       if (l) h.location = px(l);
@@ -162,6 +171,16 @@ const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/cs
 http.createServer((req, res) => {
   const reqUrl = new URL(req.url, 'http://x');
   if (req.url === '/healthz') { res.writeHead(200); return res.end('ok'); }
+  if (reqUrl.pathname === '/api/login') {
+    if (ALLOW_ORIGIN && req.headers.origin === ALLOW_ORIGIN) {
+      res.setHeader('access-control-allow-origin', ALLOW_ORIGIN);
+      res.setHeader('access-control-allow-headers', 'content-type');
+      res.setHeader('vary', 'origin');
+    }
+    if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+    if (PASSWORD && req.method === 'POST') return handleLogin(req, res);
+    res.writeHead(404); return res.end();
+  }
   if (PASSWORD && reqUrl.pathname === '/login' && req.method === 'POST') return handleLogin(req, res);
   if (!authed(req)) { res.writeHead(401, { 'content-type': 'text/html' }); return res.end(loginPage()); }
   if (reqUrl.pathname === '/proxy') return handleProxy(req, res, reqUrl);
